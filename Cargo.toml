@@ -1,0 +1,11 @@
+[package]
+name = "focus"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] } # Komut satırı argümanları için
+serde = { version = "1.0", features = ["derive"] } # Veri yapısı serileştirme
+serde_json = "1.0" # JSON okuma/yazma
+chrono = { version = "0.4", features = ["serde"] } # Saat ve tarih işlemleri
+anyhow = "1.0" # Hata yönetimi kolaylığı
