@@ -37,21 +37,25 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Kural ekle (Aynı domain için birden fazla saat aralığı ekleyebilirsin)
+    #[command(aliases = ["a"])]
     Add {
         domain: String,
         start: String,
         end: String,
     },
     /// Bir siteye ait TÜM kuralları siler
+    #[command(aliases = ["r", "rm"])]
     Remove {
         domain: String,
     },
     /// Geçici istisna tanımla
+    #[command(aliases = ["e", "exc"])]
     Exception {
         domain: String,
         minutes: i64,
     },
     /// Kuralları listele
+    #[command(aliases = ["ls"])]
     List,
     /// Arka plan servisi (Manuel çalıştırma)
     Daemon,
