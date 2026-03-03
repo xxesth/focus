@@ -160,7 +160,6 @@ fn update_hosts_file(rules: &[Rule]) -> Result<()> {
     
     let mut domains_to_block = Vec::new();
     
-    // Tüm kuralları gez
     for rule in rules {
         let start = NaiveTime::parse_from_str(&rule.start_time, "%H:%M")?;
         let end = NaiveTime::parse_from_str(&rule.end_time, "%H:%M")?;
@@ -172,27 +171,20 @@ fn update_hosts_file(rules: &[Rule]) -> Result<()> {
         };
 
         if in_time_window {
-            // İstisna kontrolü
             let is_exception = match rule.exception_until {
                 Some(expiry) => expiry > now,
                 None => false,
             };
 
-            // Eğer süre içindeysek VE istisna yoksa listeye al
             if !is_exception {
-                // Aynı domain listede tekrar etmesin diye kontrol etmeyelim, 
-                // hosts dosyasına yazarken unique yaparız veya overwrite ederiz.
-                // Basitlik için direkt ekliyorum.
                 domains_to_block.push(rule.domain.clone());
             }
         }
     }
     
-    // Tekrarlayan domainleri temizle (Dedup)
     domains_to_block.sort();
     domains_to_block.dedup();
 
-    // Hosts okuma/yazma işlemleri (Aynı kaldı)
     let hosts_content = fs::read_to_string(HOSTS_PATH).unwrap_or_default();
     let mut new_lines: Vec<String> = Vec::new();
     let mut in_block = false;
@@ -215,6 +207,7 @@ fn update_hosts_file(rules: &[Rule]) -> Result<()> {
     let final_content = new_lines.join("\n");
     if final_content.trim() != hosts_content.trim() {
         fs::write(HOSTS_PATH, final_content).context("Hosts dosyası yazılamadı (sudo?)")?;
+        kill_active_connections(); // Daemon belirli bir süre bloklanır
     }
 
     Ok(())
@@ -287,6 +280,31 @@ fn update_screen_color(config: &Config, current_state: &mut Option<bool>) -> Res
     }
 
     Ok(())
+}
+
+fn kill_active_connections() {
+    // TCP 443: HTTPS, UDP 443: HTTP3 / QUIC, TCP 80: HTTP
+    let targets = [
+        ("tcp", "443"),
+        ("udp", "443"), 
+        ("tcp", "80"),
+    ];
+
+    // println!("Bağlantılar kesiliyor (Active connection kill)...");
+
+    for (proto, port) in &targets {
+        let _ = Command::new("iptables")
+            .args(["-A", "OUTPUT", "-p", proto, "--dport", port, "-j", "DROP"])
+            .output();
+    }
+
+    thread::sleep(Duration::from_secs(5)); // Daemon bu kadar süre bloklanır
+
+    for (proto, port) in &targets {
+        let _ = Command::new("iptables")
+            .args(["-D", "OUTPUT", "-p", proto, "--dport", port, "-j", "DROP"])
+            .output();
+    }
 }
 
 fn main() -> Result<()> {
