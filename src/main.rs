@@ -186,6 +186,7 @@ fn update_hosts_file(rules: &[Rule]) -> Result<()> {
     domains_to_block.dedup();
 
     let hosts_content = fs::read_to_string(HOSTS_PATH).unwrap_or_default();
+    let old_block_count = hosts_content.lines().filter(|l| l.contains("127.0.0.1")).count();
     let mut new_lines: Vec<String> = Vec::new();
     let mut in_block = false;
 
@@ -205,15 +206,20 @@ fn update_hosts_file(rules: &[Rule]) -> Result<()> {
     }
 
     let final_content = new_lines.join("\n");
+    let new_block_count = final_content.lines().filter(|l| l.contains("127.0.0.1")).count();
     if final_content.trim() != hosts_content.trim() {
         fs::write(HOSTS_PATH, final_content).context("Hosts dosyası yazılamadı (sudo?)")?;
-        kill_active_connections(); // Daemon belirli bir süre bloklanır
+        if new_block_count > old_block_count {
+             kill_active_connections();
+        } else {
+            let _ = Command::new("resolvectl").arg("flush-caches").output();
+            let _ = Command::new("nscd").arg("-i").arg("hosts").output();
+        }
     }
 
     Ok(())
 }
 
-// Domain adını düzelt (youtube -> youtube.com)
 fn normalize_domain(input: &str) -> String {
     if input.contains('.') {
         input.to_string()
@@ -233,7 +239,7 @@ fn set_screen_grayscale(enable: bool) -> Result<()> {
         if line.contains(" connected") {
             let screen_name = line.split_whitespace().next().unwrap_or("default");
             let matrix = if enable { MATRIX_GRAYSCALE } else { MATRIX_NORMAL };
-            // println!("Setting {} to grayscale: {}", screen_name, enable);
+            println!("Setting {} to grayscale: {}", screen_name, enable);
             let _ = Command::new("xrandr")
                 .env("DISPLAY", ":0")
                 .arg("--output")
@@ -282,29 +288,78 @@ fn update_screen_color(config: &Config, current_state: &mut Option<bool>) -> Res
     Ok(())
 }
 
-fn kill_active_connections() {
-    // TCP 443: HTTPS, UDP 443: HTTP3 / QUIC, TCP 80: HTTP
-    let targets = [
-        ("tcp", "443"),
-        ("udp", "443"), 
-        ("tcp", "80"),
+fn cleanup_firewall() {
+    let commands = [
+        "iptables -w -D OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset",
+        "iptables -w -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable",
+        "iptables -w -D OUTPUT -p tcp --dport 80 -j REJECT --reject-with tcp-reset",
+
+        "iptables -w -D INPUT -p tcp --sport 443 -j REJECT --reject-with tcp-reset",
+        "iptables -w -D INPUT -p udp --sport 443 -j REJECT --reject-with icmp-port-unreachable",
+        "iptables -w -D INPUT -p tcp --sport 80 -j REJECT --reject-with tcp-reset",
+
+        "ip6tables -w -D OUTPUT -p tcp --dport 443 -j REJECT --reject-with tcp-reset",
+        "ip6tables -w -D OUTPUT -p udp --dport 443 -j REJECT --reject-with icmp6-port-unreachable",
+        "ip6tables -w -D OUTPUT -p tcp --dport 80 -j REJECT --reject-with tcp-reset",
+        
+        "ip6tables -w -D INPUT -p tcp --sport 443 -j REJECT --reject-with tcp-reset",
+        "ip6tables -w -D INPUT -p udp --sport 443 -j REJECT --reject-with icmp6-port-unreachable",
+        "ip6tables -w -D INPUT -p tcp --sport 80 -j REJECT --reject-with tcp-reset",
     ];
 
-    // println!("Bağlantılar kesiliyor (Active connection kill)...");
-
-    for (proto, port) in &targets {
-        let _ = Command::new("iptables")
-            .args(["-A", "OUTPUT", "-p", proto, "--dport", port, "-j", "DROP"])
-            .output();
+    for cmd in commands {
+        let parts: Vec<&str> = cmd.split_whitespace().collect();
+        if let Some(program) = parts.get(0) {
+            let args = &parts[1..];
+            let _ = Command::new(program).args(args).output();
+        }
     }
+}
 
-    thread::sleep(Duration::from_secs(5)); // Daemon bu kadar süre bloklanır
+fn kill_active_connections() {
+    thread::spawn(|| {
+        let duration = Duration::from_secs(45);
+        let start = std::time::Instant::now();
 
-    for (proto, port) in &targets {
-        let _ = Command::new("iptables")
-            .args(["-D", "OUTPUT", "-p", proto, "--dport", port, "-j", "DROP"])
-            .output();
-    }
+        cleanup_firewall();
+
+        let block_cmd = "
+        iptables -w -I OUTPUT 1 -p tcp --dport 443 -j REJECT --reject-with tcp-reset;
+        iptables -w -I OUTPUT 1 -p udp --dport 443 -j REJECT --reject-with icmp-port-unreachable;
+        iptables -w -I OUTPUT 1 -p tcp --dport 80 -j REJECT --reject-with tcp-reset;
+        iptables -w -I INPUT 1 -p tcp --sport 443 -j REJECT --reject-with tcp-reset;
+        iptables -w -I INPUT 1 -p udp --sport 443 -j REJECT --reject-with icmp-port-unreachable;
+
+        ip6tables -w -I OUTPUT 1 -p tcp --dport 443 -j REJECT --reject-with tcp-reset;
+        ip6tables -w -I OUTPUT 1 -p udp --dport 443 -j REJECT --reject-with icmp6-port-unreachable;
+        ip6tables -w -I OUTPUT 1 -p tcp --dport 80 -j REJECT --reject-with tcp-reset;
+        ip6tables -w -I INPUT 1 -p tcp --sport 443 -j REJECT --reject-with tcp-reset;
+        ip6tables -w -I INPUT 1 -p udp --sport 443 -j REJECT --reject-with icmp6-port-unreachable;
+        ";
+        let _ = Command::new("sh").arg("-c").arg(block_cmd).output();
+
+        while start.elapsed() < duration {
+            let nuke_cmd = "
+            ss -K dst :443;
+            ss -K dst :80;
+            ss -K -6 dst :443;
+            ss -K -6 dst :80;
+
+            conntrack -D -p tcp --dport 443 > /dev/null 2>&1;
+            conntrack -D -p udp --dport 443 > /dev/null 2>&1;
+            conntrack -D -p tcp --dport 80 > /dev/null 2>&1;
+
+            conntrack -D -f ipv6 -p tcp --dport 443 > /dev/null 2>&1;
+            conntrack -D -f ipv6 -p udp --dport 443 > /dev/null 2>&1;
+            ";
+
+            let _ = Command::new("sh").arg("-c").arg(nuke_cmd).output();
+
+            thread::sleep(Duration::from_secs(2));
+        }
+
+        cleanup_firewall();
+    });
 }
 
 fn main() -> Result<()> {
@@ -454,6 +509,7 @@ fn main() -> Result<()> {
 
         Commands::Daemon => {
             println!("Focus Daemon çalışıyor...");
+            cleanup_firewall();
             let mut last_bw_state: Option<bool> = None;
             loop {
                 if let Ok(config) = load_config() {
